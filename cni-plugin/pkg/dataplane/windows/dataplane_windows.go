@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -301,10 +302,28 @@ func ensureVxlanNetworkExists(networkName string, subNet *net.IPNet, vni uint64,
 	expectedGW := getNthIP(subNet, 1)
 	var expectedVNI uint64
 
+	// Pin the HNS Overlay network to a specific physical adapter to make the
+	// VXLAN underlay deterministic across reboots/HNS restarts. Without this,
+	// HNS picks an adapter at network-creation time and on multi-NIC nodes the
+	// choice is non-deterministic — the "rug-pull" symptom: a recreated Calico
+	// HNS network bound to a different NIC severs live pod TCP connections.
+	//
+	// Resolution order for the adapter name:
+	//   1. VXLAN_ADAPTER env var (explicit override, matches the convention in
+	//      node-service.ps1's "New-HNSNetwork -AdapterName $env:VXLAN_ADAPTER")
+	//   2. Auto-discover from the IP env var: rke2 sets IP=<node-ip>/<prefix>
+	//      and we look up the interface that carries that IP, then strip any
+	//      "vEthernet (...)" Hyper-V wrapper to get the physical adapter name.
+	//   3. Empty (legacy behavior — HNS picks; not deterministic).
+	expectedAdapterName := resolvePinnedAdapterName(logger)
+	logger.Infof("[BD-PATCH-v3] ensureVxlanNetworkExists called for network=%q expectedAdapterName=%q subnet=%q vni=%d",
+		networkName, expectedAdapterName, subNet.String(), vni)
+
 	expectedNetwork := &hcsshim.HNSNetwork{
-		Name:    networkName,
-		Type:    "Overlay",
-		Subnets: make([]hcsshim.Subnet, 0, 1),
+		Name:               networkName,
+		Type:               "Overlay",
+		NetworkAdapterName: expectedAdapterName,
+		Subnets:            make([]hcsshim.Subnet, 0, 1),
 	}
 
 	if vni == 0 {
@@ -318,16 +337,32 @@ func ensureVxlanNetworkExists(networkName string, subNet *net.IPNet, vni uint64,
 	// Checking if HNS network exists
 	existingNetwork, _ := hcsshim.GetHNSNetworkByName(networkName)
 	if existingNetwork != nil {
-		if existingNetwork.Type == expectedNetwork.Type {
+		logger.Infof("[BD-PATCH-v3] Found existing %q HNS network: id=%s type=%s mgmtIP=%s adapterName=%q subnetCount=%d",
+			networkName, existingNetwork.Id, existingNetwork.Type,
+			existingNetwork.ManagementIP, existingNetwork.NetworkAdapterName, len(existingNetwork.Subnets))
+		typeMatch := existingNetwork.Type == expectedNetwork.Type
+		adapterMatch := existingNetwork.NetworkAdapterName == expectedAdapterName
+		logger.Infof("[BD-PATCH-v3] Comparison: typeMatch=%v adapterMatch=%v (existing=%q expected=%q)",
+			typeMatch, adapterMatch, existingNetwork.NetworkAdapterName, expectedAdapterName)
+		if typeMatch && adapterMatch {
 			for _, subnet := range existingNetwork.Subnets {
 				if subnet.AddressPrefix == expectedAddressPrefix && subnet.GatewayAddress == expectedGW.String() {
 					createNetwork = false
-					logger.Infof("Found existing HNS network [%+v]", existingNetwork)
+					logger.Infof("[BD-PATCH-v3] Existing network matches all expected fields; reusing. [%+v]", existingNetwork)
 					break
 				}
 			}
+			if createNetwork {
+				logger.Infof("[BD-PATCH-v3] Existing network has type+adapter match but no matching subnet; will recreate")
+			}
+		} else if !adapterMatch {
+			logger.Infof("[BD-PATCH-v3] Existing network adapter mismatch (existing=%q expected=%q); will recreate to pin to expected adapter",
+				existingNetwork.NetworkAdapterName, expectedAdapterName)
 		}
+	} else {
+		logger.Infof("[BD-PATCH-v3] No existing %q HNS network found; will create", networkName)
 	}
+	logger.Infof("[BD-PATCH-v3] Decision: createNetwork=%v", createNetwork)
 
 	if createNetwork {
 		// Delete stale network
@@ -383,6 +418,16 @@ func ensureVxlanNetworkExists(networkName string, subNet *net.IPNet, vni uint64,
 		}
 
 		logger.Infof("Created HNSNetwork %s", networkName)
+		// Re-fetch to confirm what HNS actually persisted (especially NetworkAdapterName).
+		confirmed, gerr := hcsshim.HNSNetworkRequest("GET", newNetwork.Id, "")
+		if gerr == nil && confirmed != nil {
+			logger.Infof("[BD-PATCH-v3] Confirmed created network: id=%s mgmtIP=%s adapterName=%q",
+				confirmed.Id, confirmed.ManagementIP, confirmed.NetworkAdapterName)
+			if confirmed.NetworkAdapterName != expectedAdapterName {
+				logger.Warnf("[BD-PATCH-v3] HNS persisted NetworkAdapterName=%q does NOT match requested %q; HNS may have ignored the field",
+					confirmed.NetworkAdapterName, expectedAdapterName)
+			}
+		}
 		existingNetwork = newNetwork
 	}
 
@@ -981,6 +1026,91 @@ func lookupManagementIface(mgmtIP net.IP, logger *logrus.Entry) (net.Interface, 
 		}
 	}
 	return net.Interface{}, fmt.Errorf("couldn't find an interface matching management IP %s", mgmtIP.String())
+}
+
+// resolvePinnedAdapterName returns the physical adapter name to bind the Calico
+// HNS Overlay network to. Resolution order:
+//  1. VXLAN_ADAPTER env var (explicit override).
+//  2. Auto-discover from the IP env var: find the interface whose IPv4 address
+//     exactly matches the IP rke2 told us to use, then strip any "vEthernet (X)"
+//     Hyper-V wrapper to get the physical adapter name "X". This works because
+//     a Hyper-V vSwitch is always named after its underlying physical NIC.
+//  3. Empty string — HNS will pick (legacy non-deterministic behavior).
+func resolvePinnedAdapterName(logger *logrus.Entry) string {
+	if explicit := os.Getenv("VXLAN_ADAPTER"); explicit != "" {
+		logger.Infof("[BD-PATCH-v3] resolvePinnedAdapterName: VXLAN_ADAPTER=%q (explicit override)", explicit)
+		return explicit
+	}
+
+	ipEnv := os.Getenv("IP")
+	if ipEnv == "" || ipEnv == "autodetect" || ipEnv == "none" {
+		logger.Infof("[BD-PATCH-v3] resolvePinnedAdapterName: IP env=%q is not a literal address; cannot auto-discover adapter; will fall back to HNS default", ipEnv)
+		return ""
+	}
+
+	// Strip optional "/N" prefix length suffix.
+	ipStr := ipEnv
+	if i := strings.Index(ipStr, "/"); i >= 0 {
+		ipStr = ipStr[:i]
+	}
+	mgmtIP := net.ParseIP(ipStr)
+	if mgmtIP == nil {
+		logger.Warnf("[BD-PATCH-v3] resolvePinnedAdapterName: failed to parse IP env=%q; cannot auto-discover adapter", ipEnv)
+		return ""
+	}
+	mgmtIPv4 := mgmtIP.To4()
+	if mgmtIPv4 == nil {
+		logger.Warnf("[BD-PATCH-v3] resolvePinnedAdapterName: IP env=%q is not IPv4; cannot auto-discover adapter", ipEnv)
+		return ""
+	}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		logger.WithError(err).Warnf("[BD-PATCH-v3] resolvePinnedAdapterName: failed to enumerate interfaces; cannot auto-discover adapter")
+		return ""
+	}
+	for _, iface := range ifaces {
+		addrs, aerr := iface.Addrs()
+		if aerr != nil {
+			continue
+		}
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil {
+				continue
+			}
+			ipv4 := ip.To4()
+			if ipv4 == nil {
+				continue
+			}
+			if ipv4.Equal(mgmtIPv4) {
+				physical := stripVEthernetPrefix(iface.Name)
+				logger.Infof("[BD-PATCH-v3] resolvePinnedAdapterName: found IP %s on iface %q (physical %q)",
+					mgmtIPv4.String(), iface.Name, physical)
+				return physical
+			}
+		}
+	}
+	logger.Warnf("[BD-PATCH-v3] resolvePinnedAdapterName: no interface holds IP %s; cannot auto-discover adapter", mgmtIPv4.String())
+	return ""
+}
+
+// stripVEthernetPrefix turns "vEthernet (X)" into "X" (the underlying physical
+// adapter name). Returns the input unchanged if the wrapper is not present.
+// HNS expects the physical adapter name when binding a vSwitch; the
+// vEthernet form is what shows up after the vSwitch is already bound.
+func stripVEthernetPrefix(name string) string {
+	const prefix = "vEthernet ("
+	if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, ")") {
+		return name[len(prefix) : len(name)-1]
+	}
+	return name
 }
 
 func lookupManagementAddr(mgmtIP net.IP, logger *logrus.Entry) (*net.IPNet, error) {
