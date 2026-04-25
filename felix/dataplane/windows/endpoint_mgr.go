@@ -49,6 +49,14 @@ const (
 	// the default hns network name to use if the envNetworkName environment
 	// variable does not resolve to a value
 	defaultNetworkName = "(?i)calico.*"
+	// maxFailedLookups bounds how many consecutive HNS endpoint lookup
+	// failures we tolerate for a single WorkloadEndpoint before we purge it
+	// from pendingWlEpUpdates. Without a bound, an orphaned WEP whose HNS
+	// endpoint never appears (e.g. due to a kubelet/HCN crash leaving the
+	// datastore-side WorkloadEndpoint alive) drives an unbounded retry loop
+	// in CompleteDeferredWork. The next legitimate WorkloadEndpointUpdate
+	// from the calc graph will re-add the WEP and the counter restarts.
+	maxFailedLookups = 12
 )
 
 var (
@@ -68,6 +76,10 @@ type endpointManager struct {
 	pendingWlEpUpdates map[types.WorkloadEndpointID]*proto.WorkloadEndpoint
 	// activeWlEndpoints stores the active/current state that was applied per endpoint
 	activeWlEndpoints map[types.WorkloadEndpointID]*proto.WorkloadEndpoint
+	// failedLookupCount tracks consecutive HNS endpoint lookup failures per
+	// WorkloadEndpoint. Reset on successful resolution or explicit purge.
+	// See maxFailedLookups for the bound.
+	failedLookupCount map[types.WorkloadEndpointID]int
 	// addressToEndpointId serves as a hns endpoint id cache. It enables us to lookup the hns
 	// endpoint id for a given endpoint ip address.
 	addressToEndpointId map[string]string
@@ -122,6 +134,7 @@ func newEndpointManager(hns hnsInterface,
 		addressToEndpointId: make(map[string]string),
 		activeWlEndpoints:   map[types.WorkloadEndpointID]*proto.WorkloadEndpoint{},
 		pendingWlEpUpdates:  map[types.WorkloadEndpointID]*proto.WorkloadEndpoint{},
+		failedLookupCount:   map[types.WorkloadEndpointID]int{},
 		pendingIPSetUpdate:  set.New[string](),
 		hostAddrs:           hostIPv4s,
 	}
@@ -355,11 +368,28 @@ func (m *endpointManager) CompleteDeferredWork() error {
 				}
 			}
 			if endpointId == "" {
-				// Failed to find the associated hns endpoint id
-				logCxt.Warn("Failed to look up HNS endpoint for workload")
+				// Failed to find the associated hns endpoint id. Track
+				// consecutive failures so we don't retry forever.
+				m.failedLookupCount[id]++
+				attempts := m.failedLookupCount[id]
+				if attempts >= maxFailedLookups {
+					// Bail: HNS endpoint has been missing for too long.
+					// Purge the WEP from pendingWlEpUpdates so we stop
+					// hammering HNS. A subsequent WorkloadEndpointUpdate
+					// from the calc graph will re-add it (and reset the
+					// counter via OnUpdate -> the delete in this branch).
+					logCxt.WithField("attempts", attempts).Warn(
+						"Giving up looking up HNS endpoint for workload; will retry on next WorkloadEndpointUpdate")
+					delete(m.pendingWlEpUpdates, id)
+					delete(m.failedLookupCount, id)
+					continue
+				}
+				logCxt.WithField("attempts", attempts).Warn("Failed to look up HNS endpoint for workload")
 				missingEndpoints = true
 				continue
 			}
+			// Successful resolution: clear any prior failure count.
+			delete(m.failedLookupCount, id)
 
 			logCxt.Info("Processing endpoint add/update")
 
@@ -442,6 +472,7 @@ func (m *endpointManager) CompleteDeferredWork() error {
 			logCxt.Info("Processing endpoint removal")
 			delete(m.activeWlEndpoints, id)
 			delete(m.pendingWlEpUpdates, id)
+			delete(m.failedLookupCount, id)
 		}
 	}
 
@@ -453,31 +484,65 @@ func (m *endpointManager) CompleteDeferredWork() error {
 	return nil
 }
 
-// extractUnicastIPv4Addrs examines the raw input addresses and returns any IPv4 addresses found.
-func extractUnicastIPv4Addrs(addrs []net.Addr) []string {
+// interfaceExcludeRegex matches host interfaces whose IPs must NOT participate in
+// host-to-workload rules. Mirrors node/pkg/lifecycle/startup/autodetection's
+// DEFAULT_INTERFACES_TO_EXCLUDE for Windows. The "(nat)" entry is critical: the
+// HNS NAT switch reassigns its 172.x.x.x address whenever HNS is restarted, which
+// would otherwise drive markAllEndpointForRefresh and rewrite ACL policy on every
+// pod endpoint, severing live TCP connections (the rug-pull symptom).
+var interfaceExcludeRegex = regexp.MustCompile(
+	`(.*cbr.*)|(.*[Dd]ocker.*)|(.*\(nat\).*)|(.*Calico.*_ep)|(Loopback.*)`,
+)
+
+// extractUnicastIPv4Addrs returns the IPv4 addresses on host interfaces that
+// belong in the host-IP set. It excludes interfaces matching interfaceExcludeRegex
+// (HNS NAT, Docker bridges, Calico's own host endpoint, loopback) and IPv4
+// addresses that are loopback or link-local (169.254/16 APIPA). The latter
+// can transiently appear/disappear when a NIC briefly de-binds, so including
+// them would also drive spurious refreshes.
+//
+// Switches from net.InterfaceAddrs() (flat) to net.Interfaces() (per-interface)
+// so we can apply the same name-based exclusion regex used by autodetection at
+// startup, instead of receiving every IPv4 on every interface uniformly.
+func extractUnicastIPv4Addrs(_ []net.Addr) []string {
 	var ips []string
-
-	for _, a := range addrs {
-		var ip net.IP
-
-		switch a := a.(type) {
-		case *net.IPNet:
-			ip = a.IP
-		case *net.IPAddr:
-			ip = a.IP
-		}
-
-		if ip == nil || len(ip.To4()) == 0 {
-			// Windows dataplane doesn't support IPv6 yet.
-			continue
-		}
-		if ip.IsLoopback() {
-			// Skip 127.0.0.1.
-			continue
-		}
-		ips = append(ips, ip.String()+"/32")
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		log.WithError(err).Warn("Failed to enumerate host interfaces")
+		return ips
 	}
-
+	for _, iface := range ifaces {
+		if interfaceExcludeRegex.MatchString(iface.Name) {
+			log.WithField("interface", iface.Name).Debug("Skipping excluded interface")
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			log.WithError(err).WithField("interface", iface.Name).Debug("Failed to get interface addresses")
+			continue
+		}
+		for _, a := range addrs {
+			var ip net.IP
+			switch a := a.(type) {
+			case *net.IPNet:
+				ip = a.IP
+			case *net.IPAddr:
+				ip = a.IP
+			}
+			if ip == nil || len(ip.To4()) == 0 {
+				continue
+			}
+			if ip.IsLoopback() {
+				continue
+			}
+			if ip.IsLinkLocalUnicast() {
+				// 169.254/16 APIPA. Transiently assigned by Windows when a
+				// NIC briefly disconnects; would falsely trigger a refresh.
+				continue
+			}
+			ips = append(ips, ip.String()+"/32")
+		}
+	}
 	return ips
 }
 
@@ -583,6 +648,9 @@ func prependAll(prefix string, in []string) (out []string) {
 func loopPollingForInterfaceAddrs(c chan []string) {
 	var lastSortedUpdate []string
 	for range time.NewTicker(10 * time.Second).C {
+		// Note: addrs from net.InterfaceAddrs is intentionally ignored by the
+		// new extractUnicastIPv4Addrs (it re-enumerates per interface to apply
+		// name-based exclusion). Kept for API compatibility.
 		addrs, err := net.InterfaceAddrs()
 		if err != nil {
 			log.WithError(err).Panic("Failed to get host interface addresses")
@@ -595,7 +663,12 @@ func loopPollingForInterfaceAddrs(c chan []string) {
 			continue
 		}
 
-		log.WithField("update", ipv4s).Debug("Interface addresses updated.")
+		// Update the last-sent set BEFORE sending so a tight reschedule loop
+		// doesn't repeatedly re-send the same IPs (the original code never
+		// updated this variable, defeating its dedup purpose).
+		lastSortedUpdate = ipv4s
+
+		log.WithField("update", ipv4s).Info("Interface addresses updated.")
 		c <- ipv4s
 	}
 }
